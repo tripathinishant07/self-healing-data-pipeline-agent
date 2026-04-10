@@ -4,6 +4,7 @@ from datetime import datetime,timezone
 import botocore
 import boto3
 import psycopg2
+from psycopg2.extras import Json as psycopg_json
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -138,14 +139,77 @@ def create_incident(evt: IncidentEvent) -> dict:
 
     ts = evt.timestamp or datetime.now(timezone.utc)
 
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            # Finding pipepline_id
+            cur.execute("select id from agent.pipelines where name = %s;", (evt.pipeline_name,))
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError(f"Unknown pipeline: {evt.pipeline_name}")
+            pipeline_id = row[0]
+
+            # Create incident
+            cur.execute(
+                """
+                insert into agent.incidents(pipeline_id, event_type, payload_json, detected_at, status)
+                values (%s, %s, %s::jsonb, %s, 'OPEN')
+                returning incident_id;
+                """,
+                (pipeline_id, evt.event_type, psycopg_json(evt.payload), ts),
+            )
+            incident_id = cur.fetchone()[0]
+
+        conn.commit()
+
+    return {"accepted": True, "incident_id": incident_id}
     # Saving only an audit row in smoke_test to prove end-to-end DB write
+    # with get_pg_conn() as conn:
+    #     with conn.cursor() as cur:
+    #         cur.execute(
+    #             "insert into agent.smoke_test(note) values (%s) returning id;",
+    #             (f"incident:{evt.pipeline_name}:{evt.event_type}:{ts.isoformat()}",),
+    #         )
+    #         new_id = cur.fetchone()[0]
+    #     conn.commit()
+    # not using anymore as audit work is done.
+    # return {"accepted": True, "audit_id": new_id}
+
+@app.get("/incidents")
+def list_indents(limit: int = 20) -> list[dict]:
+    """
+    Function to extract number of incidents that have been recorded.
+    These incidents can be from any pipeline.
+
+    Args:
+        limit (int) : Limit number for extracting results from database. Defaults to 20.
+
+    Returns:
+        list[dict]: Returns a list of dictionary containing incident_id, name of the pipeline
+            type of error/event, status of the error/event and the time it was detected. Ordered
+            by detection time
+    """
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "insert into agent.smoke_test(note) values (%s) returning id;",
-                (f"incident:{evt.pipeline_name}:{evt.event_type}:{ts.isoformat()}",),
+                """
+                select i.incident_id, p.name, i.event_type, i.status, i.detected_at
+                from incidents i
+                join agent.pipelines p on p.id = i.pipeline_id
+                order by i.detected_at desc
+                limit %s;
+                """,
+                (limit,),
             )
-            new_id = cur.fetchone()[0]
-        conn.commit()
+            rows = cur.fetchall()
 
-    return {"accepted": True, "audit_id": new_id}
+    return [
+        {
+            "incident_id": r[0],
+            "pipeline": r[1],
+            "event_type": r[2],
+            "status": r[3],
+            "detected_at": r[4],
+        }
+        for r in rows
+    ]
