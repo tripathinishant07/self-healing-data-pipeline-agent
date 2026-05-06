@@ -8,6 +8,8 @@ from psycopg2.extras import Json as psycopg_json
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from app.diagnoser import diagnose
+
 # Extracting value from .env variables
 def _env(name: str, default: str | None = None) -> str:
     """
@@ -139,6 +141,8 @@ def create_incident(evt: IncidentEvent) -> dict:
 
     ts = evt.timestamp or datetime.now(timezone.utc)
 
+    diag = diagnose(evt.event_type, evt.payload)
+
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             # Finding pipepline_id
@@ -151,17 +155,23 @@ def create_incident(evt: IncidentEvent) -> dict:
             # Create incident
             cur.execute(
                 """
-                insert into agent.incidents(pipeline_id, event_type, payload_json, detected_at, status)
-                values (%s, %s, %s::jsonb, %s, 'OPEN')
+                insert into agent.incidents(pipeline_id, event_type,
+                incident_type, confidence, error_signature,
+                summary, payload_json, detected_at, status)
+                values (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'OPEN')
                 returning incident_id;
                 """,
-                (pipeline_id, evt.event_type, psycopg_json(evt.payload), ts),
+                (
+                    pipeline_id, evt.event_type,
+                    diag.incident_type, diag.confidence,
+                    diag.error_signature, diag.summary,
+                    psycopg_json(evt.payload), ts),
             )
             incident_id = cur.fetchone()[0]
 
         conn.commit()
 
-    return {"accepted": True, "incident_id": incident_id}
+    return {"accepted": True, "incident_id": incident_id, "diagnosis": diag.__dict__}
     # Saving only an audit row in smoke_test to prove end-to-end DB write
     # with get_pg_conn() as conn:
     #     with conn.cursor() as cur:
@@ -213,3 +223,51 @@ def list_indents(limit: int = 20) -> list[dict]:
         }
         for r in rows
     ]
+
+@app.get("/incidents/{incident_id}")
+def get_incident(incident_id: int) -> dict:
+    """
+    Function to extract the detailed information about any particular incident.
+
+    Args:
+        incident_id (int): Integer id of the incident that has been saved in the database
+            and is available from '/incidents' get request.
+
+    Returns:
+        dict: Containing all the details related to the incident.
+    """
+
+    # getting all details for given incident id
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    i.incident_id, p.name, i.event_type, i.incident_type,
+                    i.confidence, i.error_signature, i.summary, i.payload_json,
+                    i.status, i.detected_at, i.resolved_at
+                from agent.incidents i
+                join agent.pipelines p on p.id = i.pipeline_id
+                where i.incident_id = %s;
+                """,
+                (incident_id,),
+            )
+            row = cur.fetchone()
+
+    if row is None:
+        return {"found": False, "incident_id": incident_id}
+
+    return {
+        "found": True,
+        "incident_id": row[0],
+        "pipepline": row[1],
+        "event_type": row[2],
+        "incident_type": row[3],
+        "confidence": row[4],
+        "error_signature": row[5],
+        "summary": row[6],
+        "payload": row[7],
+        "status": row[8],
+        "detected_at": row[9],
+        "resolved_at": row[10],
+    }
